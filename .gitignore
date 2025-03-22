@@ -1,0 +1,6 @@
+*.png
+*.html
+.venv/
+.ropeproject/
+pyrightconfig.json
+*.csv

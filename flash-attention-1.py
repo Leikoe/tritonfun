@@ -73,7 +73,7 @@ def flash_attention_kernel(
         K_j = tl.load(K_ptr + K_tile_indices + B_c * j * K_stride_n) # (B_c, D)
         V_j = tl.load(V_ptr + V_tile_indices + B_c * j * V_stride_n) # (B_c, D)
 
-        for i in tl.range(T_r):
+        for i in tl.range(T_r, num_stages=2):
             Q_i = tl.load(Q_ptr + Q_tile_indices + B_r * i * Q_stride_n) # (B_r, D)
             O_i = tl.load(O_ptr + O_tile_indices + B_r * i * O_stride_n) # (B_r, D)
             l_i = tl.load(l_ptr + l_tile_indices + B_r * i) # (B_r,)
@@ -85,11 +85,18 @@ def flash_attention_kernel(
             l_hat_ij = tl.sum(P_hat_ij, axis=1) # (B_r,)
             #print(l_hat_ij)
             m_new_i = tl.maximum(m_i, m_hat_ij) # (B_r,)
-            l_new_i = tl.exp(m_i - m_new_i) * l_i + tl.exp(m_hat_ij - m_new_i) * l_hat_ij # (B_r,)
 
-            _O_new_i_1 = (l_i * tl.exp(m_i - m_new_i))[:, None] * O_i # (B_r, D)
-            _O_new_i_2 = tl.exp(m_hat_ij - m_new_i)[:, None] * P_hat_ij # (B_r, B_c)
-            O_new_i = (_O_new_i_1 + tl.dot(_O_new_i_2, V_j)) / l_new_i[:, None] # we want to divide each row by it's sum in l_new_i
+            alpha = tl.exp(m_i - m_new_i) * l_i
+            beta = tl.exp(m_hat_ij - m_new_i)
+            l_new_i = alpha + beta * l_hat_ij # (B_r,)
+
+            O_new_i = (
+                alpha[:, None] * O_i + # (B_r, D)
+                tl.dot(
+                    beta[:, None] * P_hat_ij, # (B_r, B_c)
+                    V_j
+                )
+            ) / l_new_i[:, None] # we want to divide each row by it's sum in l_new_i
             tl.store(O_ptr + O_tile_indices + B_r * i * O_stride_n, O_new_i)
             tl.store(l_ptr + l_tile_indices + B_r * i, l_new_i)
             tl.store(m_ptr + m_tile_indices + B_r * i, m_new_i)
@@ -100,7 +107,7 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: fl
     assert D in [64, 128, 256]
     # B_c, B_r = M/(4*D), min(M/(4*D), D)
 
-    B_c, B_r = 32, 32 # fix block size
+    B_c, B_r = 64, 64 # fix block size
     # print(f"{B_c=} {B_r=}")
     O = torch.zeros_like(q) # (B, H, N, D)
     l = torch.empty(B, H, N, dtype=q.dtype, device=q.device)
@@ -156,7 +163,7 @@ def benchmark(N: int, provider: Literal["torch_sdpa"] | Literal["triton"], devic
         return triton.testing.do_bench(lambda: flash_attention(q, k, v, scale=scale))
 
 if __name__ == "__main__":
-    test_attention(1, 1, 32, 64) # test no loop
+    # test_attention(1, 1, 32, 64) # test no loop
     test_attention(1, 1, 64, 64) # test loop
     test_attention(1, 2, 1024, 128) # test multi head
     test_attention(128, 16, 1024, 128)

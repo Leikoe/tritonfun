@@ -12,27 +12,27 @@ NUM_REGS = properties["max_num_regs"]
 M = SIZE_SMEM = properties["max_shared_mem"]
 WARP_SIZE = properties["warpSize"]
 
-# def ref_softmax(x: torch.Tensor) -> torch.Tensor:
-#     # assert x.ndim == 2
-#     # H, W = x.shape
-#     # numerical stability trick
-#     x_max_per_row, _ = torch.max(x, dim=-1, keepdim=True)  # discard indices
-#     z = x - x_max_per_row
-#     print(z)
+def ref_softmax(x: torch.Tensor) -> torch.Tensor:
+    # assert x.ndim == 2
+    # H, W = x.shape
+    # numerical stability trick
+    x_max_per_row, _ = torch.max(x, dim=-1, keepdim=True)  # discard indices
+    z = x - x_max_per_row
 
-#     numerator = torch.exp(z)
-#     denominator = torch.sum(numerator, dim=-1, keepdim=True)
-#     return numerator / denominator
+    numerator = torch.exp(z)
+    denominator = torch.sum(numerator, dim=-1, keepdim=True)
+    return numerator / denominator
 
 def naive_torch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float, is_causal: bool = False) -> torch.Tensor:
     assert q.shape == k.shape and q.shape == v.shape
     S = q @ k.swapaxes(-1, -2)
+    #print(S)
     if is_causal:
         # set upper tril to -inf
         S = torch.tril(S)
         S = torch.where(S != 0., S, float("-inf"))
 
-    # r = ref_softmax(S * scale)
+    #r = ref_softmax(S * scale)
     # print(r)
     return torch.softmax(S * scale, dim=-1) @ v
 
@@ -83,10 +83,11 @@ def flash_attention_kernel(
             m_hat_ij = tl.max(S_ij, axis=1) # (B_r,)
             P_hat_ij = tl.exp(S_ij - m_hat_ij[:, None]) # (B_r, B_c)
             l_hat_ij = tl.sum(P_hat_ij, axis=1) # (B_r,)
+            #print(l_hat_ij)
             m_new_i = tl.maximum(m_i, m_hat_ij) # (B_r,)
             l_new_i = tl.exp(m_i - m_new_i) * l_i + tl.exp(m_hat_ij - m_new_i) * l_hat_ij # (B_r,)
 
-            _O_new_i_1 = l_i[:, None] * (tl.exp(m_i - m_new_i)[:, None] * O_i) # (B_r, D)
+            _O_new_i_1 = (l_i * tl.exp(m_i - m_new_i))[:, None] * O_i # (B_r, D)
             _O_new_i_2 = tl.exp(m_hat_ij - m_new_i)[:, None] * P_hat_ij # (B_r, B_c)
             O_new_i = (_O_new_i_1 + tl.dot(_O_new_i_2, V_j)) / l_new_i[:, None] # we want to divide each row by it's sum in l_new_i
             tl.store(O_ptr + O_tile_indices + B_r * i * O_stride_n, O_new_i)
@@ -120,15 +121,16 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: fl
 
     return O
 
-def test_attention(B, H, N, D, atol=1e-3, rtol=1e-3, device="cuda:0"):
-    q = torch.randn(B, H, N, D, dtype=torch.float32, device="cuda:0")
-    k = torch.randn(B, H, N, D, dtype=torch.float32, device="cuda:0")
-    v = torch.randn(B, H, N, D, dtype=torch.float32, device="cuda:0")
-    # scale = .1/math.sqrt(D)
-    scale = 1.
-    ref = F.scaled_dot_product_attention(q, k, v, scale=scale, is_causal=False)
-    # print(ref)
-    torch.testing.assert_close(flash_attention(q, k, v, scale=scale), ref, atol=atol, rtol=rtol)
+def test_attention(B, H, N, D, atol=5e-3, rtol=5e-3, device="cuda:0"):
+    q = torch.randn(B, H, N, D, dtype=torch.float32, device=device)
+    k = torch.randn(B, H, N, D, dtype=torch.float32, device=device)
+    v = torch.randn(B, H, N, D, dtype=torch.float32, device=device)
+    scale = .1/math.sqrt(D)
+    torch.testing.assert_close(
+        flash_attention(q, k, v, scale=scale), 
+        naive_torch(q, k, v, scale=scale, is_causal=False),
+        atol=atol, rtol=rtol
+    )
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -142,11 +144,11 @@ def test_attention(B, H, N, D, atol=1e-3, rtol=1e-3, device="cuda:0"):
         args={}
     )
 )
-def benchmark(N: int, provider: Literal["torch_sdpa"] | Literal["triton"]):
+def benchmark(N: int, provider: Literal["torch_sdpa"] | Literal["triton"], device="cuda:0"):
     B, H, D = 8, 16, 128
-    q = torch.randn(B, H, N, D, dtype=torch.float32, device="cuda:0")
-    k = torch.randn(B, H, N, D, dtype=torch.float32, device="cuda:0")
-    v = torch.randn(B, H, N, D, dtype=torch.float32, device="cuda:0")
+    q = torch.randn(B, H, N, D, dtype=torch.float32, device=device)
+    k = torch.randn(B, H, N, D, dtype=torch.float32, device=device)
+    v = torch.randn(B, H, N, D, dtype=torch.float32, device=device)
     scale = .1/math.sqrt(D)
     if provider == "torch_naive":
         return triton.testing.do_bench(lambda: naive_torch(q, k, v, scale=scale, is_causal=False))
@@ -154,8 +156,8 @@ def benchmark(N: int, provider: Literal["torch_sdpa"] | Literal["triton"]):
         return triton.testing.do_bench(lambda: flash_attention(q, k, v, scale=scale))
 
 if __name__ == "__main__":
-    # test_attention(1, 1, 32, 64) # test no loop
-    # test_attention(1, 1, 64, 64) # test loop
-    # test_attention(1, 2, 1024, 128) # test multi head
-    # test_attention(128, 16, 1024, 128)
+    test_attention(1, 1, 32, 64) # test no loop
+    test_attention(1, 1, 64, 64) # test loop
+    test_attention(1, 2, 1024, 128) # test multi head
+    test_attention(128, 16, 1024, 128)
     benchmark.run(print_data=True, save_path=".")

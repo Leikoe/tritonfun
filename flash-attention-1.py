@@ -142,7 +142,7 @@ def test_attention(B, H, N, D, atol=5e-3, rtol=5e-3, device="cuda:0"):
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["N"],
-        x_vals=[2**i for i in range(6, 11)],
+        x_vals=[2**i for i in range(6, 12)],
         line_arg="provider",
         line_vals=["torch_naive", "triton"],
         line_names=["Torch naive", "triton"],
@@ -151,7 +151,7 @@ def test_attention(B, H, N, D, atol=5e-3, rtol=5e-3, device="cuda:0"):
         args={}
     )
 )
-def benchmark(N: int, provider: Literal["torch_sdpa"] | Literal["triton"], device="cuda:0"):
+def benchmark(N: int, provider: Literal["torch_naive"] | Literal["triton"], device="cuda:0"):
     B, H, D = 8, 16, 128
     q = torch.randn(B, H, N, D, dtype=torch.float32, device=device)
     k = torch.randn(B, H, N, D, dtype=torch.float32, device=device)
